@@ -12,13 +12,13 @@ from transformers.models import LlamaForCausalLM
 
 MODEL_NAME_OR_PATH = "/home/marcorentap/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
 SGLANG_SERVER = "http://localhost:30000"
-CANDIDATES_SIZE = 8
-DUMMIES_SIZE = 8
+CANDIDATES_SIZE = 16
+DUMMIES_SIZE = 16
 MAX_TOKENS = 128
 TEMPERATURE = 0
 
 # How many post dummies until candidates are considered wrong
-POST_DUMMY_THRESHOLD = 4
+POST_DUMMY_THRESHOLD = 8
 
 model = LlamaForCausalLM.from_pretrained(MODEL_NAME_OR_PATH)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_PATH)
@@ -67,7 +67,7 @@ async def send_request(toks: List[int], req_id: str):
 
 async def peek_one(prefix: List[int]) -> List[List[int]]:
     cand_toks, dummy_toks = gen_next_tokens(prefix)
-    candidates = [prefix + [tok, dummy_toks[0]] for tok in cand_toks]
+    candidates = [prefix + [tok, tok] for tok in cand_toks]
     dummies = [prefix + [dummy_toks[0], dummy_toks[0]] for _ in dummy_toks]
 
     tasks = []
@@ -111,25 +111,63 @@ async def peek_one(prefix: List[int]) -> List[List[int]]:
 
 
 async def main():
-    victim_input = input("Enter victim's prompt: \n")
-    known_prefix = input("Enter known prefix: \n")
+    input = json.load(open("input.json"))
+    victims = input["victims"]
+    known_prefixes = input["prefixes"]
+
+    victim_toks = [tokenizer.encode(victim) for victim in victims]
+    known_prefix_toks = [
+        tokenizer.encode(known_prefix) for known_prefix in known_prefixes
+    ]
 
     # Flush Cache
     requests.post(SGLANG_SERVER + "/flush_cache")
 
     # Victim
-    victim_toks = tokenizer.encode(victim_input)
-    await send_request(victim_toks, "victim_0")
+    for i, victim_tok in enumerate(victim_toks):
+        await send_request(victim_tok, f"victim_{i}")
 
-    prefixes = [tokenizer.encode(known_prefix)]
-    while len(prefixes) > 0:
-        prefix = prefixes.pop(0)
-        if len(prefix) > len(victim_toks):
-            break
+    for known_prefix in known_prefix_toks:
+        found_victims = []
+        prefixes = [known_prefix]
+        while len(prefixes) > 0:
+            prefix = prefixes.pop(0)
+            print()
+            print("Trying:", tokenizer.decode(prefix))
 
-        print(tokenizer.decode(prefix))
-        next_prefixes = await peek_one(prefix)
-        prefixes.extend(next_prefixes)
+            # Find victim with most matching prefix
+            closest_victim_toks = []
+            max_match_len = 0
+            had_comparison = False
+            for v in victim_toks:
+                if v in found_victims:
+                    continue
+                had_comparison = True
+                common = 0
+                for a, b in zip(prefix, v):
+                    if a == b:
+                        common += 1
+                    else:
+                        break
+                if common > max_match_len:
+                    max_match_len = common
+                    closest_victim_toks = v
+
+            # If no victims left, go to next known prefix
+            if not had_comparison:
+                print("No matching victim")
+                break
+
+            print("Closest victim:", tokenizer.decode(closest_victim_toks))
+
+            # Compare the length with most matching victim
+            if len(prefix) >= len(closest_victim_toks):
+                found_victims.append(prefix)
+                print("Found victim:", tokenizer.decode(closest_victim_toks))
+                continue
+
+            next_prefixes = await peek_one(prefix)
+            prefixes.extend(next_prefixes)
 
 
 if __name__ == "__main__":
