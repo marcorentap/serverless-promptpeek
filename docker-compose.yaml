@@ -1,0 +1,51 @@
+services:
+    sglang:
+        # image: marcorentap/sglang:v0.4.10-cu126-promptpeek
+        image: lmsysorg/sglang:v0.4.10-cu126
+        container_name: sglang
+        volumes:
+            - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+            - ${HOME}/projects/sglang:/sgl-workspace/sglang
+            # If you use modelscope, you need mount this directory
+            # - ${HOME}/.cache/modelscope:/root/.cache/modelscope
+        restart: always
+        network_mode: host # required by RDMA
+        privileged: true # required by RDMA
+        # Or you can only publish port 30000
+        # ports:
+        #   - 30000:30000
+        env_file:
+            - .env
+        environment:
+            HF_TOKEN: ${HF_TOKEN}
+            # if you use modelscope to download model, you need set this environment
+            # - SGLANG_USE_MODELSCOPE: true
+        entrypoint: /bin/sh -c "pip install -e /sgl-workspace/sglang/python && python3 -m sglang.launch_server \"$@\"" --
+        # entrypoint: /bin/sh -c "pip install -e /sgl-workspace/sglang/python && python3 -m sglang.launch_server"
+        command:
+            --model-path /root/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6
+            --host 0.0.0.0
+            --port 30000
+            --schedule-policy lpm
+            --enable-metrics
+            --max-running-requests 4
+            --log-level error
+            # --disable-overlap-schedule
+            # --model-path "/root/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instructsnapshots/5a8abab4a5d6f164389b1079fb721cfab8d7126c"
+            # --schedule-conservativeness 0.1
+            # --model-path unsloth/Llama-3.2-1B-Instruct
+
+        ulimits:
+            memlock: -1
+            stack: 67108864
+        ipc: host
+        healthcheck:
+            test:
+                ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          device_ids: ["0"]
+                          capabilities: [gpu]
